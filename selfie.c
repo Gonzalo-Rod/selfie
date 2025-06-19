@@ -212,6 +212,7 @@ void zero_memory(uint64_t *memory, uint64_t size);
 
 uint64_t *zalloc(uint64_t size);  // internal use only!
 uint64_t *zmalloc(uint64_t size); // use this to allocate zeroed memory
+void sort_context_priority();
 
 // ------------------------ GLOBAL CONSTANTS -----------------------
 
@@ -1307,6 +1308,9 @@ void implement_brk(uint64_t *context);
 void emit_get_pid();
 void implement_get_pid(uint64_t *context);
 
+void emit_priority_set();
+void implement_priority_set(uint64_t *context); 
+
 void emit_sched();
 void implement_sched(uint64_t *context);
 
@@ -1338,7 +1342,7 @@ uint64_t SYSCALL_SCHED = 27;
 uint64_t SYSCALL_FORK = 23;
 uint64_t SYSCALL_LOCK = 31;
 uint64_t SYSCALL_UNLOCK = 32;
-
+uint64_t SYSCALL_PRIORITY_SET=40;
 /* DIRFD_AT_FDCWD corresponds to AT_FDCWD in fcntl.h and
    is passed as first argument of the openat system call
    emulating the (in Linux) deprecated open system call. */
@@ -2107,6 +2111,7 @@ uint64_t heap_writes = 0;
 
 // ------------------------- INITIALIZATION ------------------------
 
+
 void init_interpreter()
 {
   EXCEPTIONS = smalloc((EXCEPTION_INTEGEROVERFLOW + 1) * sizeof(uint64_t *));
@@ -2272,7 +2277,7 @@ uint64_t *delete_context(uint64_t *context, uint64_t *from);
 // number of entries of a machine context:
 // 14 uint64_t + 6 uint64_t* + 1 char* + 7 uint64_t + 2 uint64_t* + 2 uint64_t entries
 // extended in the symbolic execution engine and the Boehm garbage collector
-uint64_t CONTEXTENTRIES = 34;
+uint64_t CONTEXTENTRIES = 36;
 
 uint64_t *allocate_context(); // declaration avoids warning in the Boehm garbage collector
 
@@ -2356,6 +2361,8 @@ uint64_t get_use_gc_kernel(uint64_t *context) { return *(context + 31); }
 
 uint64_t get_id(uint64_t *context) { return *(context + 32); }
 uint64_t* get_ptr_parent(uint64_t *context) { return (uint64_t *)*(context + 33); }
+uint64_t get_priority(uint64_t *context) { return *(context + 34); }
+uint64_t get_prev_priority(uint64_t *context) { return *(context + 35); }
 
 void set_next_context(uint64_t *context, uint64_t *next) { *context = (uint64_t)next; }
 void set_prev_context(uint64_t *context, uint64_t *prev) { *(context + 1) = (uint64_t)prev; }
@@ -2394,6 +2401,8 @@ void set_use_gc_kernel(uint64_t *context, uint64_t use) { *(context + 31) = use;
 
 void set_id(uint64_t *context, uint64_t new_pid) { *(context + 32) = new_pid; }
 void set_ptr_parent(uint64_t *context, uint64_t* parent) { *(context + 33) = (uint64_t)parent; }
+void set_priority(uint64_t *context, uint64_t priority) { *(context + 34) = priority; }
+void set_prev_priority(uint64_t *context, uint64_t prev_priority) { *(context + 35) = prev_priority; }
 
 // -----------------------------------------------------------------
 // -------------------------- MICROKERNEL --------------------------
@@ -2438,7 +2447,58 @@ uint64_t *free_contexts = (uint64_t *)0; // singly-linked list of free contexts
 
 uint64_t gen_id = 0; // general autoincremente id for processes
 // ------------------------- INITIALIZATION ------------------------
+void sort_context_priority() {
+   
+  uint64_t* one_head;
+  uint64_t* sorted_tail;
+  uint64_t* current;
+  uint64_t* ptr_max;
+  uint64_t* yanosale;
+  yanosale= used_contexts;
+  one_head = (uint64_t*) 0; 
+  sorted_tail = (uint64_t*) 0;
 
+  if (yanosale == (uint64_t*) 0) {
+    one_head= (uint64_t*) 0;
+  }
+
+  while (yanosale != (uint64_t*) 0) {
+    current = yanosale;
+    ptr_max = yanosale;
+    while (current != (uint64_t*) 0) {
+      if (get_priority(current) > get_priority(ptr_max)) {
+        ptr_max = current;
+      }
+      current = get_next_context(current);
+    }
+    if (get_prev_context(ptr_max) == (uint64_t*) 0) {
+      yanosale = get_next_context(ptr_max);
+    } 
+    if (get_prev_context(ptr_max) != (uint64_t*) 0)
+      set_next_context(get_prev_context(ptr_max), get_next_context(ptr_max));
+
+
+    if (get_next_context(ptr_max) != (uint64_t*) 0) {
+      set_prev_context(get_next_context(ptr_max), get_prev_context(ptr_max));
+    }
+
+    set_next_context(ptr_max, (uint64_t*) 0);
+    set_prev_context(ptr_max, sorted_tail);
+
+    if (sorted_tail == (uint64_t*) 0) {
+      one_head = ptr_max;
+    } else {
+      set_next_context(sorted_tail, ptr_max);
+    }
+
+    sorted_tail = ptr_max;
+  }
+
+  used_contexts = one_head;
+  //return one_head;
+
+
+}
 void reset_microkernel()
 {
   current_context = (uint64_t *)0;
@@ -6884,7 +6944,7 @@ void selfie_compile()
 
   emit_switch();
   emit_get_pid();
-
+  emit_priority_set();
   emit_sched();
 
   emit_fork();
@@ -8288,6 +8348,35 @@ void emit_sched()
   emit_jalr(REG_ZR, REG_RA, 0);
 }
 
+
+void emit_priority_set()
+{
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("priority_set"),
+                            0, PROCEDURE, VOID_T, 1, code_size);
+
+  emit_load(REG_A0, REG_SP, 0);
+
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_PRIORITY_SET);
+
+  emit_ecall();
+
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+
+void implement_priority_set(uint64_t *context)
+{
+  uint64_t value_priority;
+  value_priority = *(get_regs(context) + REG_A0); 
+  set_priority(context, value_priority);
+  sort_context_priority();
+  
+  set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+}
+
+
 void implement_sched(uint64_t *context)
 {
   SCHED_CLASS = *(get_regs(context)+REG_A0);
@@ -8384,17 +8473,49 @@ void implement_fork(uint64_t *context){
   *(parent_regs+REG_A0) = get_id(child_c); // return for parent is child's id
 
   set_ptr_parent(child_c, context);
+  sort_context_priority(); //CADA VEZ Q SE CREA UN CONTEXTO NUEVO, SE DEBE ORDENAR LA LISTA DE CONTEXTOS POR PRIORIDAD
+
+
 }
 
 
-void implement_lock(uint64_t *context)
-{
-  if (LOCK_OWNER == DEFAULT_LOCK_OWNER)
-  {
+void implement_lock(uint64_t* context) {
+  uint64_t* temp;
+  uint64_t* head;
+
+  if (LOCK_OWNER == DEFAULT_LOCK_OWNER) {//libere
     LOCK_OWNER = get_id(context);
-    set_pc(context,get_pc(context)+INSTRUCTIONSIZE);  
+    set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+  } else {
+    temp = used_contexts;
+    head = (uint64_t*)0;
+    //buscamos al q tiene el lock y lo guardamos
+    while (temp != (uint64_t*)0) {
+      if (get_id(temp) == LOCK_OWNER)
+        head = temp;
+
+      if (head != (uint64_t*)0)
+        temp = (uint64_t*)0;
+      else
+        temp = get_next_context(temp);
+    }
+    // el q tiene el lock tiene mayor prioridad intercambiamos
+    if (head != (uint64_t*)0) {
+      if (get_priority(context) > get_priority(head)) {
+        if (get_prev_priority(head) == 0){
+
+          set_prev_priority(head, get_priority(head));
+          set_priority(head, get_priority(context));
+          sort_context_priority();
+         }
+      }
+      else{
+          sort_context_priority();
+      }
+    }
   }
 }
+
 
 void emit_unlock()
 {
@@ -8408,15 +8529,29 @@ void emit_unlock()
   emit_jalr(REG_ZR, REG_RA, 0);
 }
 
+ 
 
-void implement_unlock(uint64_t *context)
-{
-  if (LOCK_OWNER == get_id(context))
-  {
+void implement_unlock(uint64_t* context) {
+  uint64_t previous;
+  uint64_t id_tiene;
+
+  id_tiene = get_id(context);
+  previous = get_prev_priority(context);
+
+  if (id_tiene == LOCK_OWNER)
     LOCK_OWNER = DEFAULT_LOCK_OWNER;
+
+  if (previous != 0) {
+    set_priority(context, previous);
+    set_prev_priority(context, 0);
+    sort_context_priority();
   }
-  set_pc(context,get_pc(context)+INSTRUCTIONSIZE);  
+
+  set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
 }
+
+
+
 
 
 void emit_read()
@@ -11116,6 +11251,9 @@ void do_ecall()
     {
       write_register(REG_A0);
     }
+    else if(*(registers + REG_A7)==SYSCALL_PRIORITY_SET){
+      write_register(REG_A0);
+    }
     else 
     {
       if (*(registers + REG_A7) != SYSCALL_EXIT)
@@ -12291,7 +12429,14 @@ void init_context(uint64_t *context, uint64_t *parent, uint64_t *vctxt)
   set_mc_stack_peak(context, HIGHESTVIRTUALADDRESS);
   set_mc_mapped_heap(context, 0);
 
+
+  set_priority(context, 30);
+
+
+
   // garbage collector
+
+
   set_used_list_head(context, (uint64_t *)0);
   set_free_list_head(context, (uint64_t *)0);
   set_gcs_in_period(context, 0);
@@ -12935,6 +13080,10 @@ uint64_t handle_system_call(uint64_t *context)
     implement_unlock(context);
   else if (a7 == SYSCALL_SCHED)
     implement_sched(context);
+  
+  else if (a7 == SYSCALL_PRIORITY_SET)
+    implement_priority_set(context);
+
   else
   {
     printf("%s: unknown system call %lu\n", selfie_name, a7);
@@ -13034,45 +13183,61 @@ uint64_t handle_exception(uint64_t *context)
   }
 }
 
-uint64_t mipster(uint64_t *to_context)
-{
+uint64_t mipster(uint64_t* to_context) {
   uint64_t timeout;
-  uint64_t *from_context;
+  uint64_t* from_context;
+  uint64_t* temp_context;
+  uint64_t* chosen;
+  uint64_t current_prio;
+  uint64_t highest_prio;
 
   timeout = TIMESLICE;
 
-  while (1)
-  {
+  while (1) {
     from_context = mipster_switch(to_context, timeout);
+    temp_context = get_next_context(from_context);
+    chosen = temp_context;
 
-    to_context = get_next_context(from_context); // this works for RR.
-    // Also, could work for priority scheduler if the list of processes is ordered
-
-    if (get_parent(from_context) != MY_CONTEXT)
-    {
-      // switch to parent which is in charge of handling exceptions
+    if (get_parent(from_context) != MY_CONTEXT) {
       to_context = get_parent(from_context);
-
       timeout = TIMEROFF;
-    }
-    else if (handle_exception(from_context) == EXIT)
-      return get_exit_code(from_context);
-    else
-    {
-      if (SCHED_CLASS == (uint64_t)0)
-      {
-        //to_context = get_next_context(from_context);
-        if (to_context == (uint64_t *)0)
-          to_context = used_contexts;
-      } else 
-      { // when is Priority Scheduler
+    } else {
+      if (handle_exception(from_context) == EXIT)
+        return get_exit_code(from_context);
 
+      if (SCHED_CLASS == 0) { // RR y pasamos al siguiente contexto
+        if (temp_context == (uint64_t*)0)
+          to_context = used_contexts;
+        else
+          to_context = temp_context;
+      } else { //Priority
+
+       //sort_context_priority(); //Buscamos el de mayor prioridad, lo ordenamos para solo tomar el primero
+
+        highest_prio = get_priority(used_contexts); //Ya estaria ordenado todo
+        current_prio = get_priority(from_context);
+
+        if (temp_context != (uint64_t*)0) {
+          if (get_priority(temp_context) != highest_prio)
+            chosen = used_contexts;
+        } 
+    
+        else {
+          chosen = used_contexts;
+        }
+
+        if (current_prio != highest_prio)
+          chosen = used_contexts;
+
+        to_context = chosen;
       }
 
       timeout = TIMESLICE;
     }
   }
 }
+
+
 
 uint64_t hypster(uint64_t *to_context)
 {
